@@ -8,7 +8,7 @@
 // 直连后 Worker 只承担封面的 AES 解密，请求量能降一个数量级。
 const SITE = 'https://huangguoai.io';
 // Worker 只做兜底。留一个就够，额度是账号级的。
-const WORKER = 'https://huangguo-web.lujec.workers.dev';
+const WORKER = 'https://hg.lujec.de5.net';
 const PAGE_SIZE = 50; // 一页 50 条
 
 // 封面解密参数，与 Worker 里一致

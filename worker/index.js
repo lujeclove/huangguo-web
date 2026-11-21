@@ -1,17 +1,11 @@
 // 黄果短剧解析 Worker（Cloudflare Workers 免费档）
 // 数据来源：https://huangguoai.com
-// 适配参考：jinshengchan/huangguo-fongmi、cluntop/tvbox(huangguo.py / huangguo2.py)
 //
-// 设计要点：
-// 1. 官方 JSON 接口优先（/api/videos/category、/api/ranks、/api/videos/{id}、/api/videos/{id}/play、/api/topics、/api/search），
-//    HTML 抓取仅作兜底 —— 官方接口含分页元数据、评分、标签、时长，比正则可靠。
-// 2. 封面为 AES-CBC 加密的**原始二进制**（非 base64 文本），须按二进制解密后校验图片魔数。
-// 3. m3u8 为 AES-128 加密切片，通过 /raw 代理重写分片与密钥 URI，保证继续走本 Worker。
-// 4. 浏览器 <video> 原生不支持 HLS，播放器库由 /hls.js 代理提供。
-// 5. 名称统一：剥离 sr-only 辅助文本与站点后缀，剧集标题一律规范为「第N集」。
-// 6. 列表解析一律**按容器块边界**切分（不再使用字符窗口），避免跨卡片串行污染。
-// 7. 播放解析优先用官方 /api/videos/{id}/play，并**对比声明时长与实际 m3u8 时长**，
-//    当源站只下发占位/预览片段时以 incomplete 标记返回，供前端如实提示（而非误判为解析失败）。
+// ★ 本版关键改动（播放）★
+// /api/play 不再在 Worker 服务端 fetch 优酷/上游 m3u8：
+//   - 优酷 CDN 按出口 IP 下发（数据中心 IP 被挡/只给预览片段），且 auth_key 有时效（~150s）；
+//   - 因此"算出直连 m3u8 地址"交给 dx150 协议完成，但**拉流动作交给浏览器**（真实 IP + 正确 Referer）；
+//   - Worker 只返回 { url(直连), proxy(/raw 兜底) }，不再服务端探测时长，避免拿到空/预览导致前端"解析失败"。
 
 const SITE = 'https://huangguoai.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36';
@@ -163,7 +157,7 @@ function fromApiItem(it) {
 function fromRankItem(it) {
   const o = fromApiItem(it);
   o.vod_id = String(it.video_id || it.id || '');
-  if (it.rank) o.vod_remarks = ('#' + it.rank + ' ' + (it.metric_label || '') + (it.metric_value || '') + ' · ' + o.vod_remarks).replace(/ · $/, '');
+  if (it.rank) o.vod_remarks = ('#' + it.rank + ' ' + (it.metric_label || '') + ' ' + (it.metric_value || '') + ' · ' + o.vod_remarks).replace(/ · $/, '');
   return o;
 }
 
@@ -315,7 +309,7 @@ async function topics(slug, page, size) {
     return {
       list: items.map((t) => ({
         vod_id: 'topic_' + t.slug,
-        vod_name: cleanTitle(t.title),
+        vod_name: cleanTitle(t.title || ''),
         vod_pic: imageProxy(t.cover || ''),
         vod_remarks: t.video_count + '部',
         vod_tags: [],
@@ -490,9 +484,6 @@ function m3u8Info(text) {
   };
 }
 
-// 播放解析：官方 /api/videos/{id}/play 优先，页面 videoInitialData 兜底；
-// 并探测真实流时长以识别源站占位/预览片段
-
 // ===== dx150-edge-v1 加密协议（站点 2026-11-09 起启用）=====
 // 业务接口迁到 /api/{playback|public|dynamic|user}/request，内层才是真实 HTTP 请求。
 // 握手：ECDH P-256 -> HKDF-SHA256 派生双密钥 -> AES-GCM 双向加密。
@@ -528,7 +519,7 @@ async function dxCall(scope,base,packet){
   let s=dxSessions[scope];
   if(!s||s.exp<=Math.floor(Date.now()/1000)+5)s=await dxOpen(scope,base);
   const seq=++s.seq,ts=Math.floor(Date.now()/1000)+s.off,iv=dxNonce(seq);
-  const p=d=>({name:'AES-GCM',iv,additionalData:enc.encode([s.info,d,seq,ts].join('\n'))});
+  const p=(d)=>({name:'AES-GCM',iv,additionalData:enc.encode([s.info,d,seq,ts].join('\n'))});
   const c=await crypto.subtle.encrypt(p('req'),s.rk,enc.encode(JSON.stringify({request:packet})));
   const rr=await fetch(base+DX_EP[scope],{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({v:1,type:'call',kid:s.kid,sid:s.sid,seq,ts,ciphertext:dxB64u(new Uint8Array(c))})});
   if(!rr.ok){delete dxSessions[scope];throw new Error('dx call '+rr.status);}
@@ -541,6 +532,7 @@ function dxPacket(method,path,obj){
   const bytes=new TextEncoder().encode(obj===undefined?'':JSON.stringify(obj));
   return {method,path,body:dxB64(bytes),content_type:obj===undefined?'':'application/json',visitor_id:''};
 }
+// 仅"计算"优酷直连 m3u8 地址；不做任何 fetch(url) 探测（拉流交给浏览器）
 async function playViaDx(id,ep){
   const base=SITE;
   const r=await dxCall('playback',base,dxPacket('POST','/api/videos/'+id+'/episodes/'+ep+'/playback',{}));
@@ -550,14 +542,14 @@ async function playViaDx(id,ep){
   return {url:st.main||st.preview||'',hevc:st.hevc||'',cdn:d.cdn||{},duration:0};
 }
 
-async function play(page, ep) {
+// 通用播放解析（无服务端探测版）：只取地址，不在 Worker 里 fetch m3u8
+async function playNoProbe(page, ep) {
   const id = (String(page || '').match(/\/video\/(\d+)/) || String(page || '').match(/^(\d+)$/) || [])[1] || '';
   const epNum = String(ep || '1');
   let stream = '';
   let declared = 0;
   let title = '';
   let source = 'page';
-
   if (id) {
     const api = await getJson(SITE + '/api/videos/' + id + '/play?ep=' + encodeURIComponent(epNum));
     if (api && api.data && api.data.video_url) {
@@ -583,19 +575,8 @@ async function play(page, ep) {
     }
   }
   stream = String(stream).replace(/\\u0026/g, '&').replace(/\\\//g, '/');
-
-  let probe = null;
-  let incomplete = false;
-  if (stream && /\.m3u8/i.test(stream)) {
-    try {
-      const r = await fetch(stream, { headers: { 'User-Agent': UA, 'Referer': SITE + '/' } });
-      if (r.ok) {
-        probe = m3u8Info(await r.text());
-        if (declared && probe.duration && probe.duration < declared * 0.8) incomplete = true;
-      }
-    } catch (e) {}
-  }
-  return { id, ep: epNum, stream, declared, title, source, probe, incomplete };
+  // 注意：这里**不**再 fetch(stream) 探测时长 —— CDN 防盗链/时效会让服务端探测失败或只拿到预览。
+  return { id, ep: epNum, stream, declared, title, source };
 }
 
 async function handle(request) {
@@ -634,33 +615,52 @@ async function handle(request) {
     if (p.indexOf('/chigua') === 0) return json(await chigua(url.searchParams.get('cate') || 'all', page, size));
     if (p.indexOf('/search/') === 0) return json(await search(decodeURIComponent(p.split('/')[2] || ''), page, size));
     if (p.indexOf('/detail/') === 0) return json(await detail(p.split('/')[2] || ''));
+
+    // ===== /api/play：只透传"优酷直连 m3u8 + 兜底代理"，绝不在 Worker 服务端拉流 =====
     if (p === '/play') {
       const rawParam = decodeURIComponent(url.searchParams.get('url') || '');
       const epParam = url.searchParams.get('ep') || '1';
       const idMatch = (String(rawParam).match(/\/video\/(\d+)/) || String(rawParam).match(/^(\d+)$/) || [])[1] || '';
+
+      // 首选 dx150：拿到优酷直连 m3u8（带时效 auth_key），交给浏览器去拉。
+      let gotDx = false;
       if (idMatch) {
         try {
           const dx = await playViaDx(idMatch, epParam);
           if (dx && dx.url) {
-            let probe = null;
-            try {
-              const hdr = { 'User-Agent': UA, 'Referer': SITE + '/' };
-              if (dx.cdn && dx.cdn.authKey) hdr[dx.cdn.authKey] = dx.cdn.authValue || '';
-              const pr = await fetch(dx.url, { headers: hdr });
-              if (pr.ok) {
-                const t = await pr.text();
-                let sec = 0; const re = /#EXTINF:([\d.]+)/g; let m;
-                while ((m = re.exec(t))) sec += parseFloat(m[1]);
-                probe = { duration: Math.round(sec * 10) / 10, segments: (t.match(/#EXTINF/g) || []).length };
-              }
-            } catch (e) {}
-            return json({ url: dx.url, proxy: origin + '/raw?url=' + encodeURIComponent(dx.url), preferDirect: true, id: idMatch, ep: epParam, hevc: dx.hevc || '', source: 'dx150', declaredDuration: probe ? probe.duration : 0, workerProbe: probe });
+            return json({
+              url: dx.url,                                   // 浏览器直连用
+              proxy: origin + '/raw?url=' + encodeURIComponent(dx.url), // 直连失败时兜底
+              preferDirect: true,
+              directHeaders: { referrer: SITE + '/' },        // 提示前端 hls.js 拉流带此 Referer
+              id: idMatch, ep: epParam, hevc: dx.hevc || '',
+              source: 'dx150',
+              // 不再返回 workerProbe / declaredDuration：服务端无法可靠探测优酷时长（IP 被挡 + auth_key 时效），
+              // 时长/完整性交由前端播放时如实体现，避免"解析失败"假阳性。
+              note: 'url 为优酷直连 m3u8（auth_key 有时效），请浏览器尽快播放；直连失败用 proxy 兜底'
+            });
           }
         } catch (e) {}
+        gotDx = true;
       }
-      const info = await play(rawParam, epParam);
-      return json({ url: info.stream, proxy: info.stream ? origin + '/raw?url=' + encodeURIComponent(info.stream) : '', preferDirect: true, id: info.id, ep: info.ep, title: info.title, source: info.source, declaredDuration: info.declared, workerProbe: info.probe });
+
+      // 兜底：dx150 不可用/取空 -> 通用解析（同样不探测）
+      if (!gotDx) {
+        const info = await playNoProbe(rawParam, epParam);
+        return json({
+          url: info.stream,
+          proxy: info.stream ? origin + '/raw?url=' + encodeURIComponent(info.stream) : '',
+          preferDirect: true,
+          directHeaders: { referrer: SITE + '/' },
+          id: info.id, ep: info.ep, title: info.title, source: info.source,
+          note: '未取到 dx150 直连，退回通用解析；url 可能为空或预览片段，前端需如实提示'
+        });
+      }
+
+      // idMatch 有但 dx 取空（且已标记 gotDx）-> 如实返回空，前端提示
+      return json({ url: '', proxy: '', preferDirect: true, directHeaders: { referrer: SITE + '/' }, id: idMatch, ep: epParam, source: 'dx150', note: 'dx150 未返回播放地址（可能剧集下架/未授权/无流）' });
     }
+
     if (p === '/recommend') return json(await category('ai-duanju', 'latest', 1, 20));
     return json(await category(p.replace(/^\//, '').replace(/\/$/, '') || 'ai-duanju', sort, page, size));
   } catch (e) {

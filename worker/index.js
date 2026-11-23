@@ -1,5 +1,5 @@
 // 黄果短剧解析 Worker（Cloudflare Workers 免费档）
-// 数据来源：https://huangguoai.com
+// 数据来源：https://huangguoai.io
 //
 // ★ 本版关键改动（播放）★
 // /api/play 不再在 Worker 服务端 fetch 优酷/上游 m3u8：
@@ -7,7 +7,7 @@
 //   - 因此"算出直连 m3u8 地址"交给 dx150 协议完成，但**拉流动作交给浏览器**（真实 IP + 正确 Referer）；
 //   - Worker 只返回 { url(直连), proxy(/raw 兜底) }，不再服务端探测时长，避免拿到空/预览导致前端"解析失败"。
 
-const SITE = 'https://huangguoai.com';
+const SITE = 'https://huangguoai.io';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36';
 const CORS = {
   'Access-Control-Allow-Origin': '*',

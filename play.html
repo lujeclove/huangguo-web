@@ -81,6 +81,11 @@ const $=s=>document.querySelector(s);
 let hlsPlayer=null;
 let DATA={id:'',ep:'1',episodes:[],list:null};
 
+// 转换函数："1" → 1，"ep-2" → 2
+function epToNum(raw) {
+  return Number(String(raw).replace(/ep-/, ''));
+}
+
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function qs(k,d){const v=new URLSearchParams(location.search).get(k);return v===null?d:v}
 function fmtDur(s){s=Math.round(Number(s)||0);if(!s)return '-';const m=Math.floor(s/60),r=s%60;return m?m+' 分 '+r+' 秒':r+' 秒';}
@@ -89,12 +94,6 @@ function destroyPlayer(){if(hlsPlayer){try{hlsPlayer.destroy()}catch(e){}hlsPlay
 function setPlayerStatus(t,cls){const el=$('#player-status');el.textContent=t||'';el.className='player-status'+(cls?' '+cls:'')}
 function setWarn(html){$('#warn').innerHTML=html||''}
 
-// 播放：**优先直连原始 m3u8**。
-// 原因：CDN 按请求出口 IP 下发不同播放列表 —— 浏览器出口=用户真实 IP，能拿到完整片源；
-// 若走 Cloudflare Worker 代理，出口是数据中心 IP，只会拿到约 54 秒的预览片段。
-// 因此 direct 是首选，fallback（Worker /raw 代理）仅在直连失败时兜底。
-// ===== 自定义播放控制条 =====
-// 不依赖原生 controls：各浏览器把控制栏裁掉或在高 z-index 层下方时，原生控件会消失。
 function fmtTime(s){
   s=Math.max(0,Math.floor(Number(s)||0));
   const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
@@ -136,7 +135,6 @@ function bindControls(){
     else if(video.webkitEnterFullscreen)video.webkitEnterFullscreen();
   };
 
-  // 控制条内的交互不应冒泡到 video，否则松手时的 click 会误触发暂停
   const ctrl=$('#hg-ctrl');
   if(ctrl){
     ['click','pointerdown','pointerup','pointermove','dblclick'].forEach(ev=>{
@@ -144,7 +142,6 @@ function bindControls(){
     });
   }
 
-  // 拖动/点击跳转：按下即跟随，松开结束
   let dragging=false;
   function seekTo(ev){
     const r=seek.getBoundingClientRect();
@@ -157,7 +154,6 @@ function bindControls(){
   seek.addEventListener('pointerup',e=>{ dragging=false; seek.releasePointerCapture&&seek.releasePointerCapture(e.pointerId); });
   seek.addEventListener('pointercancel',()=>{ dragging=false; });
 
-  // 鼠标静止 2.4 秒后淡出控制条，移动即恢复
   let idleTimer=null;
   function wake(){
     box.classList.remove('idle');
@@ -186,14 +182,12 @@ function playStream(direct, fallback, triedFallback){
   hlsPlayer=new window.Hls({lowLatencyMode:false});
   hlsPlayer.loadSource(direct);
   hlsPlayer.attachMedia(video);
-  // hls 解析出时长后立刻刷新控制条，否则首帧前时间条一直是 00:00
   hlsPlayer.on(window.Hls.Events.MANIFEST_PARSED,function(){
     const v=$('#video'); if(v){ try{v.play().catch(()=>{});}catch(e){} }
     if(window.__hgPaint) window.__hgPaint();
   });
   hlsPlayer.on(window.Hls.Events.ERROR,function(_e,data){
     if(!data||!data.fatal)return;
-    // 直连失败（CORS/签名/网络）→ 自动回退到 Worker 代理，只回退一次
     if(!triedFallback&&fallback&&fallback!==direct){
       setPlayerStatus('直连失败，改用代理重试…');
       destroyPlayer();
@@ -205,22 +199,30 @@ function playStream(direct, fallback, triedFallback){
   });
 }
 
-function markActive(ep){
-  document.querySelectorAll('.episodes button').forEach(b=>b.classList.toggle('active',b.dataset.ep===String(ep)));
-  const i=DATA.episodes.findIndex(e=>String(e.ep)===String(ep));
+function markActive(epRaw){
+  const targetNum = epToNum(epRaw);
+  document.querySelectorAll('.episodes button').forEach(b=>{
+    const btnNum = epToNum(b.dataset.ep);
+    b.classList.toggle('active', btnNum === targetNum);
+  });
+  const i = DATA.episodes.findIndex(e => epToNum(e.ep) === targetNum);
   $('#btn-prev').disabled=i<=0;
   $('#btn-next').disabled=i<0||i>=DATA.episodes.length-1;
 }
 
 async function loadEpisode(ep,push){
-  DATA.ep=String(ep);
+  DATA.ep=ep;
   markActive(DATA.ep);
-  if(push){const u=new URL(location.href);u.searchParams.set('id',DATA.id);u.searchParams.set('ep',DATA.ep);history.replaceState(null,'',u)}
-  setPlayerStatus('正在解析第'+DATA.ep+'集…');
+  if(push){
+    const u=new URL(location.href);
+    u.searchParams.set('id',DATA.id);
+    u.searchParams.set('ep',DATA.ep);
+    history.replaceState(null,'',u)
+  }
+  setPlayerStatus('正在解析 '+ep+' …');
   setWarn('');
   $('#player-loading').style.display='';
   try{
-    // 播放地址只能经 Worker 取：源站加密端点拦截了 github.io 的 Origin
     const d=await getPlay(DATA.id, DATA.ep);
     if(!d.url)throw Error('未取到播放地址');
     $('#btn-source').href=d.url;
@@ -235,9 +237,10 @@ async function loadEpisode(ep,push){
 }
 
 function step(delta){
-  const i=DATA.episodes.findIndex(e=>String(e.ep)===DATA.ep);
-  const t=DATA.episodes[i+delta];
-  if(t)loadEpisode(t.ep,true);
+  const targetNum = epToNum(DATA.ep);
+  const i = DATA.episodes.findIndex(e => epToNum(e.ep) === targetNum);
+  const t = DATA.episodes[i+delta];
+  if(t) loadEpisode(t.ep,true);
 }
 
 async function loadRelated(id){
@@ -258,20 +261,32 @@ async function init(){
     const x=(await api('/detail/'+encodeURIComponent(id))).list?.[0];
     if(!x)throw Error('详情为空');
     DATA.list=x;
-    DATA.episodes=x.episodes||[];
-    document.title=x.vod_name+' · 第'+ep+'集 · 黄果解析';
+
+    let rawEp = x.episodes || x.play_list || x.vod_play_url || x.ep;
+    DATA.episodes = Array.isArray(rawEp) ? rawEp : [];
+    console.log('分集原始数据：', DATA.episodes);
+
+    document.title=x.vod_name+' · '+ep+' · 黄果解析';
     $('#title').textContent=x.vod_name;
-    $('#player-title').textContent=x.vod_name+' · 第'+ep+'集';
+    $('#player-title').textContent=x.vod_name+' · '+ep;
     $('#desc').textContent=x.vod_desc||'暂无简介';
     $('#tags').innerHTML=(x.vod_tags||[]).map(t=>`<span>${esc(t)}</span>`).join('');
     $('#poster').innerHTML=x.vod_pic?imgTag(x.vod_pic,x.vod_name):'<span>黄果</span>';
     const meta=[['类型',(x.vod_tags||[]).join(' / ')],['集数',x.vod_episode_count?x.vod_episode_count+' 集':'-'],['状态',x.vod_finished?'已完结':'连载中'],['评分',x.vod_score?x.vod_score+' 分':'-'],['年份',x.vod_year||'-'],['作者',x.vod_author||'-'],['热度',x.vod_hot?Number(x.vod_hot).toLocaleString():'-'],['更新',x.vod_created||'-']];
     $('#meta-list').innerHTML=meta.map(m=>`<div><span>${esc(m[0])}</span><b>${esc(m[1])}</b></div>`).join('');
     $('#ep-count').textContent=DATA.episodes.length+' 集';
-    $('#episodes').innerHTML=DATA.episodes.map(e=>`<button data-ep="${esc(e.ep)}" class="${String(e.ep)===String(ep)?'active':''}">${esc(e.title||('第'+e.ep+'集'))}</button>`).join('');
-    $('#episodes').querySelectorAll('button').forEach(b=>b.onclick=()=>loadEpisode(b.dataset.ep,true));
-    $('#btn-prev').onclick=()=>step(-1);
-    $('#btn-next').onclick=()=>step(1);
+
+    if(DATA.episodes.length === 0){
+      $('#episodes').innerHTML = '<div class="empty">暂无分集</div>';
+      $('#btn-prev').disabled = true;
+      $('#btn-next').disabled = true;
+    }else{
+      $('#episodes').innerHTML=DATA.episodes.map(e=>`<button data-ep="${esc(e.ep)}" class="${ epToNum(e.ep) === epToNum(ep) ? 'active' : '' }">${esc(e.title||e.ep)}</button>`).join('');
+      $('#episodes').querySelectorAll('button').forEach(b=>b.onclick=()=>loadEpisode(b.dataset.ep,true));
+      $('#btn-prev').onclick=()=>step(-1);
+      $('#btn-next').onclick=()=>step(1);
+    }
+
     document.addEventListener('keydown',e=>{
       if(e.target.tagName==='INPUT')return;
       if(e.key==='ArrowLeft')step(-1);
